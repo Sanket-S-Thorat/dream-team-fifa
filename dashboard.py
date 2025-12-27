@@ -118,6 +118,13 @@ def calculate_custom_score(df, priorities):
     df['Scout_Score'] = normalize(df['Scout_Score']) * 100
     return df
 
+# Helper to format season string
+def format_season(year_int):
+    s = str(year_int)
+    if len(s) == 4:
+        return f"20{s[:2]}/20{s[2:]}"
+    return s
+
 # ==========================================
 # 3. SIDEBAR: THE "GM" OFFICE
 # ==========================================
@@ -129,17 +136,34 @@ if df_raw.empty:
 st.sidebar.title("👔 GM Office")
 st.sidebar.markdown("Define your team identity.")
 
-# A. Season & Budget
+# A. Season Selector (With ALL TIME Mode)
 if 'season' in df_raw.columns:
-    seasons = sorted(df_raw['season'].unique(), reverse=True)
-    season = st.sidebar.selectbox("Season", seasons)
-    df = df_raw[df_raw['season'] == season].copy()
+    # Get unique seasons
+    raw_seasons = sorted(df_raw['season'].unique(), reverse=True)
+    
+    # Create options dict
+    season_options = {format_season(s): s for s in raw_seasons}
+    # Add the "All Time" option to the top
+    season_options["✨ All Time Best"] = "All"
+    
+    # Dropdown
+    # We want "All Time" or the latest season as default? Let's default to latest season usually, 
+    # but since user asked for All Time, let's make it easy to find.
+    selected_label = st.sidebar.selectbox("Season Scope", options=list(season_options.keys()))
+    selected_season_value = season_options[selected_label]
+
+    # Filter Data
+    if selected_season_value == "All":
+        df = df_raw.copy()
+    else:
+        df = df_raw[df_raw['season'] == selected_season_value].copy()
 else:
     df = df_raw.copy()
 
+# B. Budget
 budget_m = st.sidebar.slider("Transfer Budget (€M)", 50, 500, 150)
 
-# B. The Priority Selector
+# C. The Priority Selector
 st.sidebar.divider()
 st.sidebar.subheader("🎯 Scouting Priorities")
 priority_options = [
@@ -162,6 +186,8 @@ df_scored = calculate_custom_score(df, selected_priorities)
 df_pool = df_scored.sort_values(by='Scout_Score', ascending=False)
 
 def draft_player(pool, pos, exclude_names, max_cost):
+    # If "All Time" is selected, we might have multiple rows for "Messi" (2018, 2019, etc.)
+    # We want the highest scoring version, but we must not pick him again if he's already in exclude_names.
     candidates = pool[
         (pool['Pos_Group'] == pos) & 
         (~pool['short_name'].isin(exclude_names)) & 
@@ -176,7 +202,7 @@ requirements = [('FWD', 3), ('MID', 3), ('DEF', 4), ('GK', 1)]
 
 for pos, count in requirements:
     for _ in range(count):
-        # Dynamic budget allocation heuristic
+        # Dynamic budget heuristic
         pick = draft_player(df_pool, pos, squad_names, remaining_budget * 0.45) 
         if pick is not None:
             squad.append(pick)
@@ -189,7 +215,7 @@ squad_df = pd.DataFrame(squad)
 # 5. MAIN DASHBOARD VISUALS
 # ==========================================
 st.title(f"🏆 Your 'Moneyball' Dream Team")
-st.markdown(f"**Strategy:** {' + '.join(selected_priorities)}")
+st.markdown(f"**Strategy:** {' + '.join(selected_priorities)} | **Season:** {selected_label}")
 
 if squad_df.empty:
     st.error("Could not draft a full team with the current budget constraints. Try increasing the budget.")
@@ -212,17 +238,14 @@ with tab1:
         fig = go.Figure()
         # Green Pitch
         fig.add_shape(type="rect", x0=0, y0=0, x1=100, y1=100, line=dict(color="white"), fillcolor="#1e7e34", layer="below")
-        # Center Line
         fig.add_shape(type="line", x0=50, y0=0, x1=50, y1=100, line=dict(color="white", width=2))
-        # Center Circle
         fig.add_shape(type="circle", x0=40, y0=40, x1=60, y1=60, line=dict(color="white", width=2))
         
-        # 4-3-3 Coordinates (Horizontal view 0-100)
         coords = {
             'GK': [(10, 50)], 
-            'DEF': [(30, 20), (30, 40), (30, 60), (30, 80)], # LB, CB, CB, RB
-            'MID': [(55, 30), (50, 50), (55, 70)],           # LCM, CDM, RCM
-            'FWD': [(80, 20), (85, 50), (80, 80)]            # LW, ST, RW
+            'DEF': [(30, 20), (30, 40), (30, 60), (30, 80)], 
+            'MID': [(55, 30), (50, 50), (55, 70)],           
+            'FWD': [(80, 20), (85, 50), (80, 80)]            
         }
         
         for pos_grp, xy_list in coords.items():
@@ -230,12 +253,13 @@ with tab1:
             for i, (x, y) in enumerate(xy_list):
                 if i < len(players):
                     p = players.iloc[i]
+                    p_season = format_season(p['season'])
                     fig.add_trace(go.Scatter(
                         x=[x], y=[y], mode='markers+text',
                         marker=dict(size=25, color='white', line=dict(width=2, color='black')),
                         text=[f"<b>{p['short_name']}</b><br><span style='font-size:10px'>{int(p['overall'])}</span>"],
                         textposition="top center", hoverinfo='text',
-                        hovertext=f"Name: {p['short_name']}<br>€{p['value_eur']/1e6:.1f}M<br>Score: {p['Scout_Score']:.1f}"
+                        hovertext=f"Name: {p['short_name']}<br>Season: {p_season}<br>Score: {p['Scout_Score']:.1f}"
                     ))
         
         fig.update_xaxes(showgrid=False, visible=False, range=[0, 100])
@@ -252,17 +276,22 @@ with tab2:
     
     with c1:
         analyze_pos = st.selectbox("Select Position to Analyze", ['FWD', 'MID', 'DEF', 'GK'])
-        top_10 = df_pool[df_pool['Pos_Group'] == analyze_pos].head(10).copy()
-        compare_player_name = st.selectbox("Compare Player:", top_10['short_name'])
+        # Get top 10 unique players (by name) to avoid seeing 3 versions of Messi
+        # We sort by score first, then drop duplicates keeping first
+        top_candidates = df_pool[df_pool['Pos_Group'] == analyze_pos].drop_duplicates(subset=['short_name']).head(10).copy()
         
+        if not top_candidates.empty:
+            compare_player_name = st.selectbox("Compare Player:", top_candidates['short_name'])
+        else:
+            compare_player_name = None
+            st.warning("No players found for this position criteria.")
+
     with c2:
         metrics = ['pace', 'shooting', 'passing', 'dribbling', 'defending', 'physic']
         
-        if not top_10.empty:
-            # Stats for selected player
-            player_stats = top_10[top_10['short_name'] == compare_player_name][metrics].iloc[0].values
-            # Stats for Avg
-            avg_stats = top_10[metrics].mean().values
+        if not top_candidates.empty and compare_player_name:
+            player_stats = top_candidates[top_candidates['short_name'] == compare_player_name][metrics].iloc[0].values
+            avg_stats = top_candidates[metrics].mean().values
             
             fig_radar = go.Figure()
             fig_radar.add_trace(go.Scatterpolar(
@@ -284,9 +313,9 @@ with tab2:
     st.markdown("---")
     st.markdown("#### 📏 The 'Skill Gap' (Parallel Coordinates)")
     
-    if not top_10.empty:
+    if not top_candidates.empty:
         fig_par = px.parallel_coordinates(
-            top_10, 
+            top_candidates, 
             dimensions=['overall', 'pace', 'shooting', 'passing', 'dribbling', 'defending', 'physic'],
             color="Scout_Score", 
             color_continuous_scale=px.colors.diverging.Tealrose,
@@ -299,8 +328,13 @@ with tab2:
 # --- TAB 3: MARKET ---
 with tab3:
     st.markdown("#### Are you beating the market?")
+    # Sample down market data if too large for scatter
+    market_sample = df_scored[df_scored['value_eur'] > 0]
+    if len(market_sample) > 2000:
+        market_sample = market_sample.sample(2000)
+        
     fig_scatter = px.scatter(
-        df_scored[df_scored['value_eur'] > 0],
+        market_sample,
         x="value_eur", y="Scout_Score", color="Pos_Group",
         log_x=True, hover_name="short_name", title="Entire Market vs Your Team",
         color_discrete_map={'FWD': '#EF553B', 'MID': '#00CC96', 'DEF': '#AB63FA', 'GK': '#FFA15A'}
@@ -313,7 +347,8 @@ with tab3:
 
 # --- TAB 4: ROSTER ---
 with tab4:
-    display_df = squad_df[['Pos_Group', 'short_name', 'club_name', 'age_fifa', 'overall', 'potential', 'value_eur', 'Scout_Score']].copy()
+    display_df = squad_df[['season', 'Pos_Group', 'short_name', 'club_name', 'age_fifa', 'overall', 'value_eur', 'Scout_Score']].copy()
+    display_df['season'] = display_df['season'].apply(format_season)
     display_df['value_eur'] = display_df['value_eur'].apply(lambda x: f"€{x/1e6:.1f}M")
     display_df['Scout_Score'] = display_df['Scout_Score'].round(1)
     st.dataframe(display_df, hide_index=True)
